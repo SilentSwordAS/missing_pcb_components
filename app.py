@@ -1,42 +1,43 @@
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
 import cv2
 import numpy as np
 import streamlit as st
+import yaml
 from PIL import Image
-from skimage.metrics import structural_similarity as ssim
 from streamlit_drawable_canvas import st_canvas
+from ultralytics import YOLO
 
 # --- Page Config ---
-st.set_page_config(page_title="Offline PCB Inspector", layout="wide")
-st.title("PCB Missing Part Detector")
+st.set_page_config(page_title="Offline YOLO PCB Inspector", layout="wide")
+st.title("PCB Missing Part Detector (Offline YOLO)")
 
-# Distinct high-contrast palette for bounding boxes
 BOX_COLORS = [
-    "#00C853",  # Green
-    "#2979FF",  # Blue
-    "#FF9100",  # Orange
-    "#D500F9",  # Purple
-    "#00B8D4",  # Cyan
-    "#FFD600",  # Yellow
-    "#FF4081",  # Pink
-    "#FF3D00",  # Deep Orange
+    "#00C853", "#2979FF", "#FF9100", "#D500F9",
+    "#00B8D4", "#FFD600", "#FF4081", "#FF3D00",
 ]
 
 # --- Session State Initialization ---
 if "gt_image" not in st.session_state:
     st.session_state.gt_image = None
 if "parts" not in st.session_state:
-    st.session_state.parts = []  # List of dicts: {"name": str, "box": (x, y, w, h), "color": str}
+    st.session_state.parts = []  # [{"name": str, "box": (x, y, w, h), "color": str}]
+if "trained_model_path" not in st.session_state:
+    st.session_state.trained_model_path = None
+if "class_names" not in st.session_state:
+    st.session_state.class_names = {}
 
 
-# --- Helper Functions ---
+# --- Drawing Helpers ---
 def hex_to_rgb(hex_color: str) -> tuple:
-    """Converts #RRGGBB hex string to an (R, G, B) tuple."""
     hex_color = hex_color.lstrip("#")
     return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
 
 
 def draw_label_box(img: np.ndarray, text: str, x: int, y: int, bg_color: tuple):
-    """Draws readable text with a solid background pill above a bounding box."""
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.6
     thickness = 2
@@ -45,19 +46,11 @@ def draw_label_box(img: np.ndarray, text: str, x: int, y: int, bg_color: tuple):
     top = max(0, y - th - baseline - 6)
     cv2.rectangle(img, (x, top), (x + tw + 8, top + th + baseline + 6), bg_color, -1)
     cv2.putText(
-        img,
-        text,
-        (x + 4, top + th + 2),
-        font,
-        scale,
-        (255, 255, 255),
-        thickness,
-        cv2.LINE_AA,
+        img, text, (x + 4, top + th + 2), font, scale, (255, 255, 255), thickness, cv2.LINE_AA
     )
 
 
 def render_numbered_gt_preview(gt_img: np.ndarray, parts: list) -> np.ndarray:
-    """Draws numbered, color-coded boxes on a copy of the Ground Truth image."""
     preview = gt_img.copy()
     for idx, part in enumerate(parts):
         x, y, w, h = part["box"]
@@ -67,9 +60,8 @@ def render_numbered_gt_preview(gt_img: np.ndarray, parts: list) -> np.ndarray:
     return preview
 
 
-# --- Core Offline Vision Functions ---
+# --- Image Alignment (used to project missing GT boxes accurately) ---
 def align_image(test_img: np.ndarray, gt_img: np.ndarray) -> np.ndarray:
-    """Aligns the test PCB image to the Ground Truth using ORB feature matching."""
     gray_gt = cv2.cvtColor(gt_img, cv2.COLOR_RGB2GRAY)
     gray_test = cv2.cvtColor(test_img, cv2.COLOR_RGB2GRAY)
 
@@ -98,59 +90,152 @@ def align_image(test_img: np.ndarray, gt_img: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(test_img, matrix, (w, h))
 
 
-def inspect_board(
-    gt_img: np.ndarray, test_img: np.ndarray, parts: list, threshold: float, use_alignment: bool
+# --- Offline One-Shot YOLO Training ---
+def build_augmented_dataset(gt_img: np.ndarray, parts: list, work_dir: Path, num_samples: int = 24):
+    """Generates a local augmented YOLO dataset from the single Ground Truth board."""
+    img_dir = work_dir / "images" / "train"
+    lbl_dir = work_dir / "labels" / "train"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    lbl_dir.mkdir(parents=True, exist_ok=True)
+
+    h_img, w_img = gt_img.shape[:2]
+    gt_bgr = cv2.cvtColor(gt_img, cv2.COLOR_RGB2BGR)
+
+    # Map each labeled part to its own class ID
+    class_names = {idx: part["name"] for idx, part in enumerate(parts)}
+
+    rng = np.random.default_rng(42)
+    for i in range(num_samples):
+        aug = gt_bgr.copy().astype(np.float32)
+
+        if i > 0:
+            # Brightness & contrast jitter
+            alpha = rng.uniform(0.85, 1.15)
+            beta = rng.uniform(-18, 18)
+            aug = np.clip(aug * alpha + beta, 0, 255)
+
+            # Slight Gaussian noise
+            noise = rng.normal(0, 4.0, aug.shape)
+            aug = np.clip(aug + noise, 0, 255)
+
+        aug = aug.astype(np.uint8)
+
+        # Slight translation to make YOLO robust to minor board shifts
+        dx = int(rng.integers(-12, 13)) if i > 0 else 0
+        dy = int(rng.integers(-12, 13)) if i > 0 else 0
+        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        aug = cv2.warpAffine(aug, M, (w_img, h_img), borderMode=cv2.BORDER_REPLICATE)
+
+        cv2.imwrite(str(img_dir / f"gt_{i:03d}.jpg"), aug)
+
+        # Write YOLO normalized labels: <class_id> <x_center> <y_center> <w> <h>
+        label_lines = []
+        for cls_id, part in enumerate(parts):
+            x, y, w, h = part["box"]
+            nx1 = np.clip(x + dx, 0, w_img - 1)
+            ny1 = np.clip(y + dy, 0, h_img - 1)
+            nx2 = np.clip(x + w + dx, 0, w_img - 1)
+            ny2 = np.clip(y + h + dy, 0, h_img - 1)
+
+            bw = (nx2 - nx1) / w_img
+            bh = (ny2 - ny1) / h_img
+            cx = (nx1 + nx2) / (2.0 * w_img)
+            cy = (ny1 + ny2) / (2.0 * h_img)
+
+            if bw > 0.005 and bh > 0.005:
+                label_lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+
+        (lbl_dir / f"gt_{i:03d}.txt").write_text("\n".join(label_lines))
+
+    data_yaml = {
+        "path": str(work_dir.resolve()),
+        "train": "images/train",
+        "val": "images/train",
+        "names": class_names,
+    }
+    yaml_path = work_dir / "data.yaml"
+    yaml_path.write_text(yaml.safe_dump(data_yaml))
+    return yaml_path, class_names
+
+
+def train_offline_yolo(gt_img: np.ndarray, parts: list, base_weights: str, epochs: int):
+    """Fine-tunes YOLO26n or YOLO11n locally on the augmented Ground Truth board."""
+    work_dir = Path(tempfile.mkdtemp(prefix="pcb_yolo_"))
+    yaml_path, class_names = build_augmented_dataset(gt_img, parts, work_dir)
+
+    model = YOLO(base_weights)
+    results = model.train(
+        data=str(yaml_path),
+        epochs=epochs,
+        imgsz=640,
+        batch=8,
+        workers=0,
+        cache=True,
+        project=str(work_dir / "runs"),
+        name="pcb_detector",
+        exist_ok=True,
+        verbose=False,
+        plots=False,
+    )
+
+    best_weights = Path(results.save_dir) / "weights" / "best.pt"
+    return str(best_weights), class_names
+
+
+# --- Offline YOLO Inspection ---
+def inspect_board_yolo(
+    model: YOLO,
+    gt_img: np.ndarray,
+    test_img: np.ndarray,
+    parts: list,
+    conf_threshold: float,
+    use_alignment: bool,
 ):
-    """Compares each named ROI using SSIM and highlights both present and missing parts."""
+    """Runs YOLO inference on the test board and flags any undetected GT parts as missing."""
     processed_test = (
         align_image(test_img, gt_img)
         if use_alignment
         else cv2.resize(test_img, (gt_img.shape[1], gt_img.shape[0]))
     )
 
+    # Run offline YOLO inference
+    preds = model.predict(processed_test, conf=conf_threshold, verbose=False)[0]
+
+    # Track highest-confidence detection per class ID
+    detected = {}  # cls_id -> (conf, (x1, y1, x2, y2))
+    if preds.boxes is not None:
+        for box in preds.boxes:
+            cls_id = int(box.cls[0].item())
+            conf = float(box.conf[0].item())
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            if cls_id not in detected or conf > detected[cls_id][0]:
+                detected[cls_id] = (conf, (x1, y1, x2, y2))
+
     annotated = processed_test.copy()
     missing_parts = []
     present_parts = []
 
-    for part in parts:
-        x, y, w, h = part["box"]
-        x, y = max(0, x), max(0, y)
-        roi_gt = gt_img[y : y + h, x : x + w]
-        roi_test = processed_test[y : y + h, x : x + w]
-
-        if roi_gt.size == 0 or roi_test.size == 0:
-            continue
-
-        gray_gt = cv2.cvtColor(roi_gt, cv2.COLOR_RGB2GRAY)
-        gray_test = cv2.cvtColor(roi_test, cv2.COLOR_RGB2GRAY)
-
-        min_dim = min(gray_gt.shape[0], gray_gt.shape[1])
-        win_size = min(7, min_dim if min_dim % 2 == 1 else min_dim - 1)
-        if win_size < 3:
-            continue
-
-        score = ssim(gray_gt, gray_test, win_size=win_size)
-
-        if score < threshold:
-            missing_parts.append((part["name"], score))
-            # Red highlight for missing part
+    for cls_id, part in enumerate(parts):
+        if cls_id in detected:
+            conf, (x1, y1, x2, y2) = detected[cls_id]
+            present_parts.append((part["name"], conf))
+            color_ok = (40, 167, 69)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color_ok, 2)
+            draw_label_box(annotated, f"{part['name']} ({conf:.2f})", x1, y1, color_ok)
+        else:
+            missing_parts.append(part["name"])
+            x, y, w, h = part["box"]
             color_missing = (220, 53, 69)
             cv2.rectangle(annotated, (x, y), (x + w, y + h), color_missing, 3)
             draw_label_box(annotated, f"MISSING: {part['name']}", x, y, color_missing)
-        else:
-            present_parts.append((part["name"], score))
-            # Green highlight for identified/present part
-            color_ok = (40, 167, 69)
-            cv2.rectangle(annotated, (x, y), (x + w, y + h), color_ok, 2)
-            draw_label_box(annotated, f"{part['name']} ({score:.2f})", x, y, color_ok)
 
     return missing_parts, present_parts, annotated
 
 
 # --- Minimalist UI Tabs ---
-tab_setup, tab_inspect = st.tabs(["1. Ground Truth Setup", "2. Inspect Boards"])
+tab_setup, tab_inspect = st.tabs(["1. Ground Truth & Train", "2. Inspect Boards"])
 
-# === TAB 1: GROUND TRUTH & LABELING ===
+# === TAB 1: GROUND TRUTH, LABELING & LOCAL TRAINING ===
 with tab_setup:
     gt_file = st.file_uploader("Upload Good Board (Ground Truth)", type=["png", "jpg", "jpeg"])
 
@@ -162,8 +247,6 @@ with tab_setup:
         canvas_w = 700
         scale = canvas_w / orig_w
         canvas_h = int(orig_h * scale)
-
-        # Cycle stroke color automatically for each new box drawn
         next_color = BOX_COLORS[len(st.session_state.parts) % len(BOX_COLORS)]
 
         col_canvas, col_names = st.columns([2, 1])
@@ -200,7 +283,6 @@ with tab_setup:
                     w = int((obj["width"] * obj["scaleX"]) / scale)
                     h = int((obj["height"] * obj["scaleY"]) / scale)
 
-                    # Preserve the box's drawn stroke color
                     box_color = obj.get("stroke", BOX_COLORS[idx % len(BOX_COLORS)])
                     default_name = (
                         st.session_state.parts[idx]["name"]
@@ -208,7 +290,6 @@ with tab_setup:
                         else f"Part_{idx + 1}"
                     )
 
-                    # Color-coded header matching the box on the diagram
                     st.markdown(
                         f"<span style='color:{box_color}; font-size:1.1em;'>&#9632;</span> "
                         f"**Box #{idx + 1}**",
@@ -226,30 +307,57 @@ with tab_setup:
 
                 st.session_state.parts = updated_parts
 
-        # Live numbered reference diagram so users can verify box numbers directly on the board
         if st.session_state.parts:
             with st.expander("View Numbered Reference Map", expanded=False):
-                numbered_preview = render_numbered_gt_preview(
-                    st.session_state.gt_image, st.session_state.parts
+                st.image(
+                    render_numbered_gt_preview(st.session_state.gt_image, st.session_state.parts),
+                    use_container_width=True,
                 )
-                st.image(numbered_preview, use_container_width=True)
+
+            st.divider()
+            col_m, col_e, col_btn = st.columns([1, 1, 1])
+            with col_m:
+                base_weights = st.selectbox("Local Base Model", ["yolo26m.pt"])
+            with col_e:
+                epochs = st.slider("Training Epochs", min_value=15, max_value=60, value=30, step=5)
+            with col_btn:
+                st.write("")
+                st.write("")
+                train_clicked = st.button("Train Offline YOLO Model", type="primary", use_container_width=True)
+
+            if train_clicked:
+                if not os.path.exists(base_weights):
+                    st.error(
+                        f"Local weights `{base_weights}` not found in the current directory. "
+                        "Place the `.pt` file alongside `app.py` for offline use."
+                    )
+                else:
+                    with st.spinner(f"Training {base_weights} locally on {len(st.session_state.parts)} parts..."):
+                        best_pt, cls_names = train_offline_yolo(
+                            st.session_state.gt_image, st.session_state.parts, base_weights, epochs
+                        )
+                        st.session_state.trained_model_path = best_pt
+                        st.session_state.class_names = cls_names
+                    st.success("Model trained offline! Switch to Tab 2 to inspect boards.")
 
 # === TAB 2: BATCH INSPECTION ===
 with tab_inspect:
-    if st.session_state.gt_image is None or not st.session_state.parts:
-        st.warning("Upload a Ground Truth board and label at least one part in Tab 1 first.")
+    if not st.session_state.trained_model_path:
+        st.warning("Upload a Ground Truth board, label parts, and train the YOLO model in Tab 1 first.")
     else:
         with st.sidebar:
-            st.header("Detection Settings")
-            threshold = st.slider(
-                "Similarity Threshold (SSIM)",
-                min_value=0.30,
-                max_value=0.95,
-                value=0.70,
+            st.header("YOLO Settings")
+            conf_threshold = st.slider(
+                "Detection Confidence",
+                min_value=0.15,
+                max_value=0.90,
+                value=0.45,
                 step=0.05,
-                help="Lower = more tolerant to lighting changes. Higher = stricter detection.",
+                help="Parts detected below this confidence are flagged as missing.",
             )
             use_alignment = st.checkbox("Auto-align boards (ORB)", value=True)
+
+        model = YOLO(st.session_state.trained_model_path)
 
         test_files = st.file_uploader(
             "Upload Board Photos to Inspect",
@@ -264,11 +372,12 @@ with tab_inspect:
             test_pil = Image.open(test_file).convert("RGB")
             test_np = np.array(test_pil)
 
-            missing, present, annotated_img = inspect_board(
+            missing, present, annotated_img = inspect_board_yolo(
+                model,
                 st.session_state.gt_image,
                 test_np,
                 st.session_state.parts,
-                threshold,
+                conf_threshold,
                 use_alignment,
             )
 
@@ -280,20 +389,20 @@ with tab_inspect:
                         "<h2 style='color: #28a745; margin-top: 0;'>OK</h2>",
                         unsafe_allow_html=True,
                     )
-                    st.caption(f"All {len(present)} labeled parts identified.")
+                    st.caption(f"All {len(present)} labeled parts detected.")
                 else:
                     st.markdown(
                         f"<h3 style='color: #dc3545; margin-top: 0;'>Missing ({len(missing)})</h3>",
                         unsafe_allow_html=True,
                     )
-                    for name, score in missing:
-                        st.write(f"- **{name}** (similarity: `{score:.2f}`)")
+                    for name in missing:
+                        st.write(f"- **{name}**")
 
                 if present:
                     with st.expander(f"Identified Parts ({len(present)})", expanded=False):
-                        for name, score in present:
-                            st.write(f"- {name} (`{score:.2f}`)")
+                        for name, conf in present:
+                            st.write(f"- {name} (`{conf:.2f}`)")
 
             with col_img:
                 st.image(annotated_img, use_container_width=True)
-                st.caption("Green = Identified / Present  |  Red = Missing")
+                st.caption("Green = Identified by YOLO  |  Red = Missing")
